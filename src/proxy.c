@@ -36,6 +36,8 @@ static int parse_request(const char* buf, char** out_host, char** out_port,
   char        method[16], url[1024], version[16];
   const char* p = buf;
 
+  char *host = NULL, *port = NULL, *path = NULL, *hostport = NULL;
+
   // 1) Разбор request-line
   if (sscanf(p, "%15s %1023s %15s", method, url, version) != 3)
     return -1;
@@ -45,8 +47,6 @@ static int parse_request(const char* buf, char** out_host, char** out_port,
   if (strcmp(version, "HTTP/1.0") != 0 && strcmp(version, "HTTP/1.1") != 0)
     return -1;
 
-  char *host = NULL, *port = NULL, *path = NULL;
-
   // 2) Абсолютный URI?
   if (strncmp(url, "http://", 7) == 0) {
     const char* hp = url + 7;
@@ -54,9 +54,9 @@ static int parse_request(const char* buf, char** out_host, char** out_port,
     const char* slash = strchr(hp, '/');
     size_t      hlen = slash ? (size_t)(slash - hp) : strlen(hp);
     // скопировать host[:port]
-    char* hostport = strndup(hp, hlen);
+    hostport = strndup(hp, hlen);
     if (!hostport)
-      return -1;
+      goto error;
     // разделить на host и port
     char* colon = strchr(hostport, ':');
     if (colon) {
@@ -68,21 +68,16 @@ static int parse_request(const char* buf, char** out_host, char** out_port,
       port = strdup("80");
     }
     free(hostport);
-    if (!host || !port) {
-      free(host);
-      free(port);
-      return -1;
-    }
+    hostport = NULL;
+    if (!host || !port)
+      goto error;
     // путь
     if (slash)
       path = strdup(slash);
     else
       path = strdup("/");
-    if (!path) {
-      free(host);
-      free(port);
-      return -1;
-    }
+    if (!path)
+      goto error;
   } else {
     // 3) Относительный URI — ищем Host: header
     if (url[0] != '/')
@@ -106,9 +101,9 @@ static int parse_request(const char* buf, char** out_host, char** out_port,
     char* end = strpbrk(hpos, "\r\n");
     if (!end)
       return -1;
-    char* hostport = strndup(hpos, (size_t)(end - hpos));
+    hostport = strndup(hpos, (size_t)(end - hpos));
     if (!hostport)
-      return -1;
+      goto error;
     // разделяем host и port
     char* colon = strchr(hostport, ':');
     if (colon) {
@@ -120,17 +115,12 @@ static int parse_request(const char* buf, char** out_host, char** out_port,
       port = strdup("80");
     }
     free(hostport);
-    if (!host || !port) {
-      free(host);
-      free(port);
-      return -1;
-    }
+    hostport = NULL;
+    if (!host || !port)
+      goto error;
     path = strdup(url);
-    if (!path) {
-      free(host);
-      free(port);
-      return -1;
-    }
+    if (!path)
+      goto error;
   }
 
   // 4) Успешно
@@ -138,6 +128,13 @@ static int parse_request(const char* buf, char** out_host, char** out_port,
   *out_port = port;
   *out_path = path;
   return 0;
+
+error:
+  free(host);
+  free(port);
+  free(path);
+  free(hostport);
+  return -1;
 }
 
 
@@ -220,6 +217,103 @@ CLEAN:
 
 
 /*
+  Read from fd until find "\r\n\r\n" or error.
+  Returns total length on success, -1 on failure.
+*/
+static ssize_t read_request(int fd, char* buf, size_t buf_size) {
+  ssize_t tot = 0;
+  while (1) {
+    ssize_t got = recv(fd, buf + tot, buf_size - 1 - tot, 0);
+    if (got <= 0)
+      return -1;
+    tot += got;
+    buf[tot] = '\0';
+    if (strstr(buf, "\r\n\r\n"))
+      return tot;
+    if (tot >= (ssize_t)buf_size - 1)
+      return -1;
+  }
+}
+
+
+/*
+  Build the cache lookup key "host:port/path"
+  Caller must free() the returned string.
+*/
+static char* build_cache_key(const char* host, const char* port,
+                             const char* path) {
+  size_t L = strlen(host) + 1 + strlen(port) + strlen(path) + 1;
+  char*  key = malloc(L);
+  if (!key)
+    return NULL;
+  snprintf(key, L, "%s:%s%s", host, port, path);
+  return key;
+}
+
+
+/*
+  Lookup or create a cache entry.  If newly created,
+  spawn a loader_thread().
+*/
+static cache_entry_t* get_or_create_entry(ProxyServer* serv, const char* key,
+                                          const char* host, const char* port,
+                                          const char* path) {
+  int            created;
+  cache_entry_t* e = CacheGetOrCreate(serv->cache, key, &created);
+  if (created) {
+    loader_arg_t* la = malloc(sizeof(*la));
+    if (!la) {
+      atomic_store(&e->complete, 1);
+      return e;
+    }
+    la->cache = serv->cache;
+    la->entry = e;
+    la->host = strdup(host);
+    la->port = strdup(port);
+    la->path = strdup(path);
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, loader_thread, la);
+    pthread_detach(tid);
+  }
+  return e;
+}
+
+
+/*
+  Stream the contents of cache_entry 'e' to socket 'fd'.
+  Blocks until entry->complete is set and all data sent.
+*/
+static void stream_entry_to_fd(int fd, cache_entry_t* e) {
+  size_t offset = 0;
+  for (;;) {
+    pthread_mutex_lock(&e->lock);
+    while (offset == e->size && !atomic_load(&e->complete)) {
+      pthread_cond_wait(&e->cond, &e->lock);
+    }
+    size_t new_bytes = e->size - offset;
+    int    done = atomic_load(&e->complete) && new_bytes == 0;
+    pthread_mutex_unlock(&e->lock);
+
+    if (done)
+      break;
+
+    if (new_bytes > 0) {
+      char*  p = e->value + offset;
+      size_t tosend = new_bytes;
+      while (tosend) {
+        ssize_t w = send(fd, p, tosend, 0);
+        if (w <= 0)
+          return;
+        p += w;
+        tosend -= w;
+      }
+      offset += new_bytes;
+    }
+  }
+}
+
+/*
   Run loader thread to fetch response from dest server
   to cache, if response is missing in cache.
   Fetch from cache response and send to client.
@@ -229,75 +323,30 @@ static void* handle_connection(void* arg) {
   ProxyServer* serv = c->serv;
   int          fd = c->client_fd;
 
-  char    hdr[8192];
-  ssize_t got, tot = 0;
-  while (!shutdown_flag) {
-    got = recv(fd, hdr + tot, sizeof(hdr) - 1 - tot, 0);
-    if (got <= 0)
-      goto FIN;
-    tot += got;
-    hdr[tot] = '\0';
-    if (strstr(hdr, "\r\n\r\n"))
-      break;
-    if (tot >= (ssize_t)sizeof(hdr) - 1)
-      goto FIN;
-  }
+  char *         host = NULL, *port = NULL, *path = NULL, *key = NULL;
+  cache_entry_t* e = NULL;
+  char           hdr[8192];
 
-  char *host = NULL, *port = NULL, *path = NULL;
-  if (parse_request(hdr, &host, &port, &path)) {
-    goto FREE_HDR;
-  }
+  if (read_request(fd, hdr, sizeof(hdr)) <= 0)
+    goto DONE;
 
-  size_t L = strlen(host) + 1 + strlen(port) + strlen(path) + 1;
-  char*  key = malloc(L);
-  snprintf(key, L, "%s:%s%s", host, port, path);
+  if (parse_request(hdr, &host, &port, &path) != 0)
+    goto CLEANUP_PARTS;
 
-  int            created;
-  cache_entry_t* e = CacheGetOrCreate(serv->cache, key, &created);
+  key = build_cache_key(host, port, path);
+  if (!key)
+    goto CLEANUP_PARTS;
 
-  if (created) {
-    loader_arg_t* la = malloc(sizeof(*la));
-    la->cache = serv->cache;
-    la->entry = e;
-    la->host = strdup(host);
-    la->port = strdup(port);
-    la->path = strdup(path);
-    pthread_t tid;
-    pthread_create(&tid, NULL, loader_thread, la);
-    pthread_detach(tid);
-  }
+  e = get_or_create_entry(serv, key, host, port, path);
 
-  size_t offset = 0;
-  for (;;) {
-    pthread_mutex_lock(&e->lock);
-    while (offset == e->size && !atomic_load(&e->complete)) {
-      pthread_cond_wait(&e->cond, &e->lock);
-    }
-    size_t new_bytes = e->size - offset;
-    pthread_mutex_unlock(&e->lock);
+  stream_entry_to_fd(fd, e);
 
-    if (atomic_load(&e->complete) && new_bytes == 0)
-      break;
-    if (new_bytes > 0) {
-      char*  p = e->value + offset;
-      size_t tosend = new_bytes;
-      while (tosend) {
-        ssize_t w = send(fd, p, tosend, 0);
-        if (w <= 0)
-          break;
-        p += w;
-        tosend -= w;
-      }
-      offset += new_bytes;
-    }
-  }
-
-FREE_HDR:
+CLEANUP_PARTS:
   free(host);
   free(port);
   free(path);
   free(key);
-FIN:
+DONE:
   close(fd);
   atomic_store(&c->busy, 0);
   atomic_fetch_sub(&serv->conn_cnt, 1);
@@ -310,7 +359,7 @@ FIN:
   Initialize proxy struct and create cache
   (interface to use stored cache exists, but not implemented).
 */
-int Proxy(ProxyServer* serv, ProxyConfig* cfg) {
+int InitProxy(ProxyServer* serv, ProxyConfig* cfg) {
   if (!serv || !cfg)
     return -1;
 
@@ -323,7 +372,7 @@ int Proxy(ProxyServer* serv, ProxyConfig* cfg) {
     if (!serv->cache)
       return -1;
 
-    if (Cache(serv->cache, LRU_CACHE_CAP, LRU_CACHE_BUCKETS) != 0) {
+    if (CreateCache(serv->cache, LRU_CACHE_CAP, LRU_CACHE_BUCKETS) != 0) {
       free(serv->cache);
       return -1;
     }
@@ -342,7 +391,7 @@ int Proxy(ProxyServer* serv, ProxyConfig* cfg) {
 /*
   Main endless proxy loop, gracefully shutdown when handle SIGINT.
 */
-int Serve(ProxyServer* serv) {
+int InitServerAndServe(ProxyServer* serv) {
   if (!serv)
     return -1;
 

@@ -36,6 +36,6 @@ typedef struct ProxyConfig {
 
 /*-------------API--------------*/
 
-int Proxy(ProxyServer* serv, ProxyConfig* cfg);
-int Serve(ProxyServer* serv);
+int InitProxy(ProxyServer* serv, ProxyConfig* cfg);
+int InitServerAndServe(ProxyServer* serv);
 int Shutdown(ProxyServer* serv);

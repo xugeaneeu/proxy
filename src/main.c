@@ -14,13 +14,13 @@ int main(void) {
   cfg.cache = NULL;
   cfg.cacheless = 0;
 
-  if (Proxy(&serv, &cfg)) {
+  if (InitProxy(&serv, &cfg)) {
     fprintf(stderr, "error when creating server");
     return EXIT_FAILURE;
   }
 
-  if (Serve(&serv)) {
-    fprintf(stderr, "error when trying to open listening socket");
+  if (InitServerAndServe(&serv)) {
+    Shutdown(&serv);
     return EXIT_FAILURE;
   }
 
