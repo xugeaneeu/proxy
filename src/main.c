@@ -24,5 +24,7 @@ int main(void) {
     return EXIT_FAILURE;
   }
 
+  Shutdown(&serv);
+
   return EXIT_SUCCESS;
 }
