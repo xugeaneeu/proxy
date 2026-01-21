@@ -1,6 +1,7 @@
 #include "proxy.h"
 #include "HTTPParser.h"
 #include "config.h"
+#include "net.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -56,6 +57,55 @@ typedef struct {
   char*          path;
 } loader_arg_t;
 
+
+/*
+  Network part of loading to cache.
+*/
+static void fetch_from_origin(LRU_Cache_t* cache, cache_entry_t* entry,
+                              const char* host, const char* port,
+                              const char* path) {
+  struct addrinfo  hints = {.ai_socktype = SOCK_STREAM};
+  struct addrinfo* res = NULL;
+
+  if (getaddrinfo(host, port, &hints, &res) != 0) {
+    CacheFinish(cache, entry);
+    return;
+  }
+
+  int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (sock < 0) {
+    freeaddrinfo(res);
+    CacheFinish(cache, entry);
+    return;
+  }
+
+  if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
+    close(sock);
+    freeaddrinfo(res);
+    CacheFinish(cache, entry);
+    return;
+  }
+
+  freeaddrinfo(res);
+
+  char* req = build_origin_request(host, path);
+  if (req) {
+    send(sock, req, strlen(req), 0);
+    free(req);
+  }
+
+  char    buf[8192];
+  ssize_t n;
+  while ((n = recv(sock, buf, sizeof(buf), 0)) > 0) {
+    if (CacheAppend(entry, buf, (size_t)n) != 0)
+      break;
+  }
+
+  close(sock);
+}
+
+
+
 /*
   Loader thread, starts at handle_connection if according cache entry is
   missing.
@@ -65,40 +115,10 @@ static void* loader_thread(void* arg) {
   LRU_Cache_t*   cache = la->cache;
   cache_entry_t* e = la->entry;
 
-  struct addrinfo  hints = {.ai_socktype = SOCK_STREAM};
-  struct addrinfo* res;
-  if (getaddrinfo(la->host, la->port, &hints, &res))
-    goto CLEAN;
-
-  int s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-  if (s < 0) {
-    freeaddrinfo(res);
-    goto CLEAN;
-  }
-  if (connect(s, res->ai_addr, res->ai_addrlen) < 0) {
-    close(s);
-    freeaddrinfo(res);
-    goto CLEAN;
-  }
-  freeaddrinfo(res);
-
-  char* req = build_origin_request(la->host, la->path);
-  if (req) {
-    send(s, req, strlen(req), 0);
-    free(req);
-  }
-
-  char    buf[8192];
-  ssize_t r;
-  while ((r = recv(s, buf, sizeof(buf), 0)) > 0) {
-    if (CacheAppend(e, buf, (size_t)r))
-      break;
-  }
-  close(s);
+  fetch_from_origin(cache, e, la->host, la->port, la->path);
 
   CacheFinish(cache, e);
 
-CLEAN:
   free(la->host);
   free(la->port);
   free(la->path);
@@ -241,7 +261,36 @@ DONE:
   close(fd);
   atomic_store(&c->busy, 0);
   atomic_fetch_sub(&serv->conn_cnt, 1);
+  sem_post(&serv->slot_sem);
   return NULL;
+}
+
+
+static int serve(ProxyServer* serv) {
+  while (!shutdown_flag) {
+    int client_fd = NetListener_accept(serv->listener);
+    if (client_fd < 0) {
+      if (errno == EINTR && shutdown_flag)
+        break;
+      continue;
+    }
+
+    sem_wait(&serv->slot_sem);
+
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+      int expected = 0;
+      if (atomic_compare_exchange_strong(&serv->connections[i].busy, &expected,
+                                         1)) {
+        serv->connections[i].client_fd = client_fd;
+        atomic_fetch_add(&serv->conn_cnt, 1);
+        pthread_create(&serv->connections[i].thread, NULL, handle_connection,
+                       &serv->connections[i]);
+        break;
+      }
+    }
+  }
+
+  return 0;
 }
 
 /*-------------------API-------------------*/
@@ -275,6 +324,8 @@ int InitProxy(ProxyServer* serv, ProxyConfig* cfg) {
     serv->connections[i].serv = serv;
   }
 
+  sem_init(&serv->slot_sem, 0, MAX_CONNECTIONS);
+
   return 0;
 }
 
@@ -291,57 +342,10 @@ int InitServerAndServe(ProxyServer* serv) {
   saction.sa_flags = 0;
   sigaction(SIGINT, &saction, NULL);
 
-  int ls = socket(AF_INET, SOCK_STREAM, 0);
-  if (ls < 0)
+  if (NetListener_create(&(serv->listener), PORT, MAX_CONNECTIONS))
     return -1;
 
-  int opt = 1;
-  setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-  struct sockaddr_in sa = {.sin_family = AF_INET,
-                           .sin_addr.s_addr = INADDR_ANY,
-                           .sin_port = htons(PORT)};
-
-  if (bind(ls, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
-    close(ls);
-    return -1;
-  }
-
-  if (listen(ls, MAX_CONNECTIONS) < 0) {
-    close(ls);
-    return -1;
-  }
-
-  serv->listener = ls;
-
-  while (!shutdown_flag) {
-    int client_fd = accept(ls, NULL, NULL);
-    if (client_fd < 0) {
-      if (errno == EINTR && shutdown_flag)
-        break;
-      continue;
-    }
-
-    if (atomic_load(&serv->conn_cnt) >= MAX_CONNECTIONS) {
-      const char* err = "HTTP/1.0 503 Service Unavailable\r\n"
-                        "Connection: close\r\n\r\n";
-      send(client_fd, err, strlen(err), 0);
-      close(client_fd);
-      continue;
-    }
-
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-      int exp = 0;
-      if (atomic_compare_exchange_strong(&serv->connections[i].busy, &exp, 1)) {
-        serv->connections[i].client_fd = client_fd;
-        atomic_fetch_add(&serv->conn_cnt, 1);
-        pthread_create(&serv->connections[i].thread, NULL, handle_connection,
-                       &serv->connections[i]);
-        break;
-      }
-    }
-  }
-
-  return 0;
+  return serve(serv);
 }
 
 
@@ -350,8 +354,10 @@ int InitServerAndServe(ProxyServer* serv) {
 */
 int Shutdown(ProxyServer* serv) {
   shutdown_flag = 1;
-  if (serv->listener >= 0)
-    close(serv->listener);
+
+  NetListener_destroy(serv->listener);
+
+  sem_destroy(&serv->slot_sem);
 
   for (int i = 0; i < MAX_CONNECTIONS; i++) {
     if (atomic_load(&serv->connections[i].busy)) {
@@ -364,4 +370,15 @@ int Shutdown(ProxyServer* serv) {
     serv->cache = NULL;
   }
   return 0;
+}
+
+/*
+  Return default config.
+*/
+ProxyConfig ProxyConfigDefault(void) {
+  ProxyConfig cfg;
+  cfg.port = PORT;
+  cfg.cache = NULL;
+  cfg.cacheless = 0;
+  return cfg;
 }

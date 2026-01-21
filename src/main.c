@@ -1,4 +1,3 @@
-#include "config.h"
 #include "proxy.h"
 
 #include <stddef.h>
@@ -7,12 +6,8 @@
 
 
 int main(void) {
-  ProxyConfig cfg;
+  ProxyConfig cfg = ProxyConfigDefault();
   ProxyServer serv;
-
-  cfg.port = PORT;
-  cfg.cache = NULL;
-  cfg.cacheless = 0;
 
   if (InitProxy(&serv, &cfg)) {
     fprintf(stderr, "error when creating server");

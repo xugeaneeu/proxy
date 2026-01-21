@@ -91,9 +91,6 @@ static void evict_tail(LRU_Cache_t* c) {
   detach_node(c, e);
   pthread_mutex_unlock(&c->lock);
 
-  pthread_mutex_lock(&e->lock);
-  pthread_mutex_unlock(&e->lock);
-
   atomic_fetch_sub(&c->size, e->size);
 
   pthread_mutex_destroy(&e->lock);
