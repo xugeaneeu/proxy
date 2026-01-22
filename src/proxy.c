@@ -1,6 +1,7 @@
 #include "proxy.h"
 #include "HTTPParser.h"
 #include "config.h"
+#include "logger.h"
 #include "net.h"
 
 #include <arpa/inet.h>
@@ -13,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 
@@ -65,46 +67,31 @@ typedef struct {
 static void fetch_from_origin(LRU_Cache_t* cache, cache_entry_t* entry,
                               const char* host, const char* port,
                               const char* path) {
-  struct addrinfo  hints = {.ai_socktype = SOCK_STREAM};
-  struct addrinfo* res = NULL;
-
-  if (getaddrinfo(host, port, &hints, &res) != 0) {
-    CacheFinish(cache, entry);
-    return;
-  }
-
-  int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  int sock = GetConnToOrigin(host, port);
   if (sock < 0) {
-    freeaddrinfo(res);
-    CacheFinish(cache, entry);
     return;
   }
-
-  if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-    close(sock);
-    freeaddrinfo(res);
-    CacheFinish(cache, entry);
-    return;
-  }
-
-  freeaddrinfo(res);
 
   char* req = build_origin_request(host, path);
   if (req) {
-    send(sock, req, strlen(req), 0);
+    if (send(sock, req, strlen(req), 0) < 0)
+      log_error("send");
+
     free(req);
   }
 
   char    buf[8192];
   ssize_t n;
   while ((n = recv(sock, buf, sizeof(buf), 0)) > 0) {
-    if (CacheAppend(entry, buf, (size_t)n) != 0)
+    if (CacheAppend(cache, entry, buf, (size_t)n))
       break;
   }
 
+  if (n < 0)
+    log_error("recv");
+
   close(sock);
 }
-
 
 
 /*
@@ -118,7 +105,7 @@ static void* loader_thread(void* arg) {
 
   fetch_from_origin(cache, e, la->host, la->port, la->path);
 
-  CacheFinish(cache, e);
+  MarkEntryCompleted(cache, e);
 
   free(la->host);
   free(la->port);
@@ -136,8 +123,10 @@ static ssize_t read_request(int fd, char* buf, size_t buf_size) {
   ssize_t tot = 0;
   while (1) {
     ssize_t got = recv(fd, buf + tot, buf_size - 1 - tot, 0);
-    if (got <= 0)
+    if (got <= 0) {
+      log_error("recv");
       return -1;
+    }
     tot += got;
     buf[tot] = '\0';
     if (strstr(buf, "\r\n\r\n"))
@@ -219,6 +208,7 @@ static void stream_entry_to_fd(int fd, cache_entry_t* e) {
       while (tosend) {
         ssize_t w = send(fd, p, tosend, 0);
         if (w <= 0) {
+          log_error("send");
           goto finish;
         }
         p += w;

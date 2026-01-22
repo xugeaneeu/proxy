@@ -20,3 +20,9 @@ void NetListener_destroy(NetListener* lst);
   Returns client fd ≥0, or -1 on error.
 */
 int NetListener_accept(NetListener* lst);
+
+/*
+  Attempts to resolve host:port and connect a TCP socket.
+  Returns a connected socket FD on success, or -1 on failure.
+*/
+int GetConnToOrigin(const char* host, const char* port);

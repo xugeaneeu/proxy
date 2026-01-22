@@ -242,7 +242,8 @@ cache_entry_t* CacheGetOrCreate(LRU_Cache_t* cache, const char* key,
   Return 0 in success, 1 if entry/buf/len invalid or realloc was not
   success.
 */
-int CacheAppend(cache_entry_t* entry, const char* buf, size_t len) {
+int CacheAppend(LRU_Cache_t* cache, cache_entry_t* entry, const char* buf,
+                size_t len) {
   if (!entry || !buf || len == 0)
     return EXIT_FAILURE;
 
@@ -267,6 +268,9 @@ int CacheAppend(cache_entry_t* entry, const char* buf, size_t len) {
   pthread_cond_broadcast(&entry->cond);
   pthread_mutex_unlock(&entry->cond_mutex);
 
+  while (atomic_load(&cache->size) > cache->capacity)
+    evict_tail(cache);
+
   return EXIT_SUCCESS;
 }
 
@@ -275,7 +279,7 @@ int CacheAppend(cache_entry_t* entry, const char* buf, size_t len) {
   Mark entry complete and start eviction mechanism.
   Return -1 if cache or entry invalid, else 0.
 */
-int CacheFinish(LRU_Cache_t* cache, cache_entry_t* entry) {
+int MarkEntryCompleted(LRU_Cache_t* cache, cache_entry_t* entry) {
   if (!cache || !entry)
     return -1;
 

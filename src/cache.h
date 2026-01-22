@@ -49,6 +49,7 @@ int            CreateCache(LRU_Cache_t* cache, size_t capacity, size_t buckets);
 int            DestroyCache(LRU_Cache_t* cache);
 cache_entry_t* CacheGetOrCreate(LRU_Cache_t* cache, const char* key,
                                 int* created);
-int            CacheAppend(cache_entry_t* entry, const char* buf, size_t len);
-int            CacheFinish(LRU_Cache_t* cache, cache_entry_t* entry);
-void           Destroy_entry(cache_entry_t* e);
+int  CacheAppend(LRU_Cache_t* cache, cache_entry_t* entry, const char* buf,
+                 size_t len);
+int  MarkEntryCompleted(LRU_Cache_t* cache, cache_entry_t* entry);
+void Destroy_entry(cache_entry_t* e);
