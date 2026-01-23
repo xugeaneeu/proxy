@@ -230,47 +230,35 @@ finish:
 }
 
 
-/*
-  Run loader thread to fetch response from dest server
-  to cache, if response is missing in cache.
-  Fetch from cache response and send to client.
-*/
-static void* handle_connection(void* arg) {
-  Connection*  c = arg;
-  ProxyServer* serv = c->serv;
-  int          fd = c->client_fd;
+typedef struct {
+  ProxyServer* serv;
+  int          client_fd;
+} proxy_task_t;
+
+
+static void proxy_task(void* arg) {
+  proxy_task_t* t = arg;
+  ProxyServer*  serv = t->serv;
+  int           fd = t->client_fd;
+  free(t);
 
   char *         host = NULL, *port = NULL, *path = NULL, *key = NULL;
   cache_entry_t* e = NULL;
   char           hdr[8192];
 
-  if (read_request(fd, hdr, sizeof(hdr)) <= 0)
-    goto DONE;
-
-  if (Parse_request(hdr, &host, &port, &path) != 0)
-    goto CLEANUP_PARTS;
-
-  key = build_cache_key(host, port, path);
-  if (!key)
-    goto CLEANUP_PARTS;
-
-  e = get_or_create_entry(serv, key, host, port, path);
-
-  stream_entry_to_fd(fd, e);
-
-CLEANUP_PARTS:
+  if (read_request(fd, hdr, sizeof(hdr)) > 0 &&
+      Parse_request(hdr, &host, &port, &path) == 0 &&
+      (key = build_cache_key(host, port, path)) != NULL) {
+    e = get_or_create_entry(serv, key, host, port, path);
+    if (e)
+      stream_entry_to_fd(fd, e);
+    free(key);
+  }
   free(host);
   free(port);
   free(path);
-  free(key);
-DONE:
   close(fd);
-  atomic_store(&c->busy, 0);
-  atomic_fetch_sub(&serv->conn_cnt, 1);
-  sem_post(&serv->slot_sem);
-  return NULL;
 }
-
 
 static int serve(ProxyServer* serv) {
   while (!shutdown_flag) {
@@ -280,24 +268,22 @@ static int serve(ProxyServer* serv) {
         break;
       continue;
     }
-
-    sem_wait(&serv->slot_sem);
-
-    for (int i = 0; i < MAX_CONNECTIONS; i++) {
-      int expected = 0;
-      if (atomic_compare_exchange_strong(&serv->connections[i].busy, &expected,
-                                         1)) {
-        serv->connections[i].client_fd = client_fd;
-        atomic_fetch_add(&serv->conn_cnt, 1);
-        pthread_create(&serv->connections[i].thread, NULL, handle_connection,
-                       &serv->connections[i]);
-        break;
-      }
+    proxy_task_t* task = malloc(sizeof(*task));
+    if (!task) {
+      close(client_fd);
+      continue;
+    }
+    task->serv = serv;
+    task->client_fd = client_fd;
+    if (ThreadPool_submit(&serv->pool, proxy_task, task) != 0) {
+      free(task);
+      close(client_fd);
+      break;
     }
   }
-
   return 0;
 }
+
 
 /*-------------------API-------------------*/
 
@@ -323,14 +309,14 @@ int InitProxy(ProxyServer* serv, ProxyConfig* cfg) {
     }
   }
 
-  atomic_store(&serv->conn_cnt, 0);
-  for (int i = 0; i < MAX_CONNECTIONS; i++) {
-    atomic_store(&serv->connections[i].busy, 0);
-    serv->connections[i].serv = serv;
+  if (ThreadPool_init(&serv->pool, MAX_CONNECTIONS, MAX_CONNECTIONS)) {
+    if (serv->cache && !cfg->cache) {
+      DestroyCache(serv->cache);
+      free(serv->cache);
+      serv->cache = NULL;
+    }
+    return -1;
   }
-
-  sem_init(&serv->slot_sem, 0, MAX_CONNECTIONS);
-
   return 0;
 }
 
@@ -362,13 +348,8 @@ int Shutdown(ProxyServer* serv) {
 
   NetListener_destroy(serv->listener);
 
-  sem_destroy(&serv->slot_sem);
+  ThreadPool_destroy(&serv->pool);
 
-  for (int i = 0; i < MAX_CONNECTIONS; i++) {
-    if (atomic_load(&serv->connections[i].busy)) {
-      pthread_join(serv->connections[i].thread, NULL);
-    }
-  }
   if (serv->cache) {
     DestroyCache(serv->cache);
     free(serv->cache);
@@ -376,6 +357,7 @@ int Shutdown(ProxyServer* serv) {
   }
   return 0;
 }
+
 
 /*
   Return default config.
