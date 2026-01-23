@@ -302,8 +302,7 @@ static int serve(ProxyServer* serv) {
 /*-------------------API-------------------*/
 
 /*
-  Initialize proxy struct and create cache
-  (interface to use stored cache exists, but not implemented).
+  Initialize proxy struct and create cache.
 */
 int InitProxy(ProxyServer* serv, ProxyConfig* cfg) {
   if (!serv || !cfg)
