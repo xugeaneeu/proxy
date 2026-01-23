@@ -24,7 +24,7 @@ typedef struct {
 /*
   Initialize thread-pool with `thread_count` workers
   and task queue with queue_cap.
-  Return 1 if .
+  Return 0 on success, -1 else.
 */
 int ThreadPool_init(ThreadPool* tp, size_t thread_count, size_t queue_cap);
 
@@ -35,7 +35,7 @@ int ThreadPool_init(ThreadPool* tp, size_t thread_count, size_t queue_cap);
 int ThreadPool_submit(ThreadPool* tp, void (*func)(void*), void* arg);
 
 /*
-  Waits for worker threads to complete all tasks,
-  joins them, and releases resources.
+  Waits for worker threads to complete all tasks, joins them, and releases
+  resources.
 */
 void ThreadPool_destroy(ThreadPool* tp);
